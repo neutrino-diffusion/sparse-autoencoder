@@ -8,9 +8,10 @@ import torch.optim as optim
 import MinkowskiEngine as ME
 
 import torch.nn.functional as F 
-from dataset import NearDetDataset3D
+from sparse_dataset import NearDetDataset3D
 from completion_network import CompletionNet
-
+import lightning as L
+from lightning.fabric import Fabric
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--resolution", type=int, default=128)
@@ -28,6 +29,7 @@ parser.add_argument("--max_visualization", type=int, default=4)
 parser.add_argument("--in_channel", type=int, default=1)
 parser.add_argument("--num_epochs", type=int, default=5)
 parser.add_argument("--feature_loss", type=bool, default=True)
+parser.add_argument("--num_devices", type=int, default=1)
 
 def collation_function(data):
     target_data = [datum['target'] for datum in data]
@@ -66,7 +68,51 @@ def make_data_loader(
 
     return loader
 
+def calculate_loss(out_cls, targets, sout, sin, config, device):
+    crit = nn.BCEWithLogitsLoss()
+
+    num_layers, loss = len(out_cls), 0
+    recon_f_loss = torch.tensor([0.0], device=device)
+
+    recon_f_loss = torch.tensor([0.0], device=device)
+    if config.feature_loss:
+        batch_size = sin.C[:, 0].max().item()
+        for batch_idx in range(batch_size):
+            recon_mask = (sout.C[:, 0] == batch_idx)
+            x_mask = (sin.C[:, 0] == batch_idx)
+            if (recon_mask.sum() == 0) or (x_mask.sum() == 0) :
+                continue
+            coords_recon = sout.C[recon_mask, 1:] #.cpu()
+            feats_recon = sout.F[recon_mask]
+            coords_x = sin.C[x_mask, 1:] #.cpu()
+            feats_x = sin.F[x_mask]
+            # divide nearest neighbor computation in chuck of 1000
+            sub_batch_size = 1000
+            n_sub_batches = coords_recon.shape[0] // sub_batch_size + 1
+            for sub_batch_idx in range(n_sub_batches):
+                cur_inds = range(sub_batch_idx*sub_batch_size, min((sub_batch_idx+1)*sub_batch_size, coords_recon.shape[0]))
+                if len(cur_inds) > 0:
+                    cur_coords_recon = coords_recon[cur_inds]
+                    cur_coords_recon = cur_coords_recon.reshape(-1, 1, cur_coords_recon.shape[-1])
+                    closest_x_coodinates = (coords_x - cur_coords_recon).pow(2).sum(-1).min(-1).indices
+                    recon_f_loss = F.mse_loss(feats_recon[cur_inds],
+                                                        feats_x[closest_x_coodinates],
+                                                        reduction='sum') / feats_x[closest_x_coodinates].size(0)
+                    
+    losses = []
+    for out_cl, target in zip(out_cls, targets):
+        curr_loss = crit(out_cl.F.squeeze(), target.type(out_cl.F.dtype).to(device))
+        losses.append(curr_loss.item())
+        loss += curr_loss / num_layers
+    # add features loss
+    total_loss = loss + recon_f_loss
+    return total_loss
+
+
 def train(net, dataloader, device, config):
+    # wrap with fabric for multi-gpu training
+    fabric = Fabric()
+    fabric.launch()
     optimizer = optim.SGD(
         net.parameters(),
         lr=config.lr,
@@ -75,8 +121,10 @@ def train(net, dataloader, device, config):
     )
     scheduler = optim.lr_scheduler.ExponentialLR(optimizer, 0.95)
 
-    crit = nn.BCEWithLogitsLoss()
-
+    # setup optimizer and scheduler
+    net, optimizer, scheduler = fabric.setup(net, optimizer, scheduler)
+    dataloader = fabric.setup_dataloader(dataloader)
+    
     net.train()
     logging.info(f"LR: {scheduler.get_lr()}")
 
@@ -104,44 +152,8 @@ def train(net, dataloader, device, config):
             out_cls, targets, _, sout = net(sin, target_key)
             num_layers, loss = len(out_cls), 0
             
-            ###########################
-            # Feature Loss  Calculation
-            # mayalenE/representations/minkowski_nn/losses.py
-            ###########################
-            recon_f_loss = torch.tensor([0.0], device=device)
-            if config.feature_loss:
-                batch_size = sin.C[:, 0].max().item()
-                for batch_idx in range(batch_size):
-                    recon_mask = (sout.C[:, 0] == batch_idx)
-                    x_mask = (sin.C[:, 0] == batch_idx)
-                    if (recon_mask.sum() == 0) or (x_mask.sum() == 0) :
-                        continue
-                    coords_recon = sout.C[recon_mask, 1:] #.cpu()
-                    feats_recon = sout.F[recon_mask]
-                    coords_x = sin.C[x_mask, 1:] #.cpu()
-                    feats_x = sin.F[x_mask]
-                    # divide nearest neighbor computation in chuck of 1000
-                    sub_batch_size = 1000
-                    n_sub_batches = coords_recon.shape[0] // sub_batch_size + 1
-                    for sub_batch_idx in range(n_sub_batches):
-                        cur_inds = range(sub_batch_idx*sub_batch_size, min((sub_batch_idx+1)*sub_batch_size, coords_recon.shape[0]))
-                        if len(cur_inds) > 0:
-                            cur_coords_recon = coords_recon[cur_inds]
-                            cur_coords_recon = cur_coords_recon.reshape(-1, 1, cur_coords_recon.shape[-1])
-                            closest_x_coodinates = (coords_x - cur_coords_recon).pow(2).sum(-1).min(-1).indices
-                            recon_f_loss = F.mse_loss(feats_recon[cur_inds],
-                                                                feats_x[closest_x_coodinates],
-                                                                reduction='sum') / feats_x[closest_x_coodinates].size(0)
-                            
-
-            losses = []
-            for out_cl, target in zip(out_cls, targets):
-                curr_loss = crit(out_cl.F.squeeze(), target.type(out_cl.F.dtype).to(device))
-                losses.append(curr_loss.item())
-                loss += curr_loss / num_layers
-            # add features loss
-            total_loss = loss + recon_f_loss
-            total_loss.backward()
+            total_loss = calculate_loss(out_cls, targets, sout, sin, config, device)
+            fabric.backward()
             optimizer.step()
 
             if i % config.stat_freq == 0:
@@ -149,7 +161,7 @@ def train(net, dataloader, device, config):
                     f"Iter: {i}, Loss: {loss.item():.3e}"
                 )
             print(
-                f"Iter: {i}, Total Loss: {total_loss.item():.3e}, Feature loss: {recon_f_loss.item():.3e}, Positions Loss {loss.item():.3e}"
+                f"Iter: {i}, Total Loss: {total_loss.item():.3e}"
             )
 
             if i % config.val_freq == 0 and i > 0:
